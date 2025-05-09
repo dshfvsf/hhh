@@ -1,0 +1,271 @@
+try:
+                write_result = os.path.join(self.config.OUTPUT_DIR, 'mtpTaskInfo.txt')
+                mtp_task_info = 'best_auc:' + str(self.metric_best) + \
+                                ';bestAucEpoch:' + str(self.metric_best_epoch) + \
+                                ';stopEpoch:' + str(_epoch - 1) + \
+                                ';trainSampleNumber:' + str(self.dataset.train_size) + \
+                                ';trainSamplePositiveRatio:' + str(self.dataset.train_pos_ratio) + \
+                                ';testSampleNumber:' + str(self.dataset.test_size) + \
+                                ';testSamplePositiveRatio:' + str(self.dataset.test_pos_ratio) + \
+                                ';' + str(self.data_process_info) + \
+                                ';trainCostTime:' + str(self.train_cost_time[:-2])
+                print(f"mtp_task_info: {mtp_task_info}")
+                with open(write_result, 'w') as result_file:
+                    if is_py3:
+                        result_file.write(mtp_task_info)
+                    else:
+                        result_file.write(mtp_task_info.decode('utf-8'))
+            except Exception:
+                print("write mtpTaskInfo.txt error!")
+            finally:
+                pass
+
+            if self.config.SPLIT_MODEL:
+                for i in self.config.SPLIT_MODEL_NODE_NAMES.strip().split(','):
+                    self.freeze_model(self.config.DISTRIBUTE, self.base_path, self.tag, self.tag_frozen_model,
+                                      start_time, i)
+            else:
+                self.freeze_model(self.config.DISTRIBUTE, self.base_path, self.tag, self.tag_frozen_model, start_time)
+            if self.config.ALGORITHM == 'AutoFIS' and self.search_or_retrain == "search":  # search
+                self.save_feature_interaction()
+
+            if self.config.WRITE_PREDICT_LABEL:
+                self.load_and_evaluate(sess)
+                self.save_model_predictions()
+
+        elif self.mode == 'test':
+            if self.config.USE_SFPS:
+                self.model.sfps_instance.eval()
+            self.load_and_evaluate(sess)
+            if self.config.WRITE_PREDICT_LABEL:
+                self.save_model_predictions()
+
+    def check_training_time(self, epoch_start_time):
+        epoch_train_time = int(time.time() - epoch_start_time)
+        if self.config.TRAIN_TIME_LOW != 0 and epoch_train_time < self.config.TRAIN_TIME_LOW:
+            raise ValueError("training time per epoch is abnormal:{} sec".format(epoch_train_time))
+        if self.config.TRAIN_TIME_HIGH != 0 and epoch_train_time > self.config.TRAIN_TIME_HIGH:
+            raise ValueError("training time per epoch is abnormal:{} sec".format(epoch_train_time))
+
+    def lambda_weight_evaluate(self, sess):
+        if self.config.LAMBDA_WEIGHT:
+            # read ids and wts
+            clear_or_create_dirs(os.path.join(self.config.BASE_DIR, 'train_data/soft_hdf'))
+            _, _, _, _ = self.evaluate(self.config,
+                                       None if self.dense_num == 0 else self.model.eval_dense_hldr,
+                                       None if self.num_inputs == 0 else self.model.eval_id_hldr,
+                                       None if self.num_inputs == 0 else self.model.eval_wt_hldr,
+                                       self.model.eval_preds, self.predict_train_gen,
+                                       self.num_inputs, self.dataset,
+                                       self.batch_size, sess, write_predict_label=True)
+
+    def load_and_evaluate(self, sess):
+        if self.train_para['n_epoch'] <= 0 \
+                or not os.path.exists(self.base_path + '/model/' + '%s-checkpoint' % self.tag):
+            print(f"n_epoch <= 0 or no checkpoint file, evaluate using current model.")
+            if self.config.MULTI_TASK:
+                if self.config.ALGORITHM == "CMLTV_AMT_GWD_MTL":
+                    labels_1, labels_2, preds_ltv, preds_whale = self.evaluate_mtl_whale(
+                        self.model.eval_id_hldr, self.model.eval_wt_hldr, self.model.eval_preds_ltv,
+                        self.model.eval_preds_whale,
+                        self.test_gen, self.model.eval_dense_hldr)
+                    self.metric_whale(None, -1, labels_2, preds_whale, self.mode,
+                                      pre_name="whale", cal_prob=None, pos_sample=False)
+                    self.metric_ziln(self.log_file, labels_1, preds_ltv)
+
+                else:
+                    labels_1, labels_2, preds_ctr, preds_cvr, preds_ctcvr = self.evaluate_mtl(
+                        self.model.eval_id_hldr, self.model.eval_wt_hldr, self.model.eval_preds_ctr,
+                        self.model.eval_preds_cvr,
+                        self.model.eval_preds_ctcvr, self.test_gen)
+                    self.metric(None, -1, labels_1, preds_ctr, self.mode,
+                                pre_name="ctr", cal_prob=None, pos_sample=False)
+                    self.metric(None, -1, labels_2, preds_cvr, self.mode,
+                                label_filter=labels_1, pre_name="cvr", cal_prob=None, pos_sample=False)
+                    self.metric(None, -1, labels_2, preds_ctcvr, self.mode,
+                                pre_name="ctcvr", cal_prob=None, pos_sample=False)
+            else:
+                _, labels, preds, group_ids = self.evaluate(self.config,
+                                                            None if self.dense_num == 0 else self.model.eval_dense_hldr,
+                                                            None if self.num_inputs == 0 else self.model.eval_id_hldr,
+                                                            None if self.num_inputs == 0 else self.model.eval_wt_hldr,
+                                                            self.model.eval_preds,
+                                                            self.test_gen,
+                                                            self.num_inputs,
+                                                            self.dataset,
+                                                            self.batch_size,
+                                                            sess,
+                                                            write_predict_label=self.config.WRITE_PREDICT_LABEL)
+                self.metric(None, -1, labels[:, 0] if len(labels.shape) == 2 else labels,
+                            preds, self.mode, group_ids, self.config.TOP_K_NDCG)
+        else:
+            print(f"Save predictions using last checkpoint model.")
+            pb_path = os.path.join(
+                self.base_path,
+                'model',
+                f'{self.tag}_frozen_model.pb'
+            )
+            if not os.path.exists(pb_path):
+                print(f"{pb_path} doesn't exists, start to freeze graph.")
+                output_node_names = 'predictionNode'
+                if self.config.MULTI_TASK:
+                    if self.config.ALGORITHM == "CMLTV_AMT_GWD_MTL":
+                        output_node_names = 'ltv_prediction_node,whale_prediction_node'
+                    else:
+                        output_node_names = 'ctr_prediction_node,cvr_prediction_node,predictionNode'
+                        if self.config.ALGORITHM == "CalibCMTL":
+                            output_node_names = \
+                                'ctr_prediction_node,cvr_prediction_node,predictionNode,Calib_predictionNode'
+                else:
+                    output_node_names = output_node_names
+
+                freeze_graph(model_folder=self.base_path + '/model/',
+                             latest_filename='%s-checkpoint' % self.tag, tag=self.tag,
+                             output_node_names=output_node_names,
+                             config_=self.config)
+
+            if self.config.MULTI_TASK:
+                if self.config.ALGORITHM == "CMLTV_AMT_GWD_MTL":
+                    graph, sess = load_model(pb_path)
+                    eval_preds_ltv = graph.get_tensor_by_name('ltv_prediction_node:0')
+                    eval_preds_whale = graph.get_tensor_by_name('whale_prediction_node:0')
+                    eval_id_hldr = graph.get_tensor_by_name('id:0')
+                    eval_wt_hldr = graph.get_tensor_by_name('wt:0')
+                    labels_1, labels_2, preds_ltv, preds_whale = self.evaluate_mtl_whale(
+                        eval_id_hldr, eval_wt_hldr, eval_preds_ltv, eval_preds_whale,
+                        self.test_gen)
+                    self.metric_zlin(None, -1, labels_1, preds_ltv, self.mode,
+                                     pre_name="ltv", cal_prob=None, pos_sample=False)
+                    self.metric(None, -1, labels_2, preds_whale, self.mode,
+                                label_filter=labels_1, pre_name="whale", cal_prob=None, pos_sample=False)
+                else:
+                    graph, sess = load_model(pb_path)
+                    eval_preds_ctr = graph.get_tensor_by_name('ctr_prediction_node:0')
+                    eval_preds_cvr = graph.get_tensor_by_name('cvr_prediction_node:0')
+                    eval_preds_ctcvr = graph.get_tensor_by_name('predictionNode:0')
+                    eval_id_hldr = graph.get_tensor_by_name('id:0')
+                    eval_wt_hldr = graph.get_tensor_by_name('wt:0')
+                    labels_1, labels_2, preds_ctr, preds_cvr, preds_ctcvr = self.evaluate_mtl(
+                        eval_id_hldr, eval_wt_hldr, eval_preds_ctr, eval_preds_cvr, eval_preds_ctcvr,
+                        self.test_gen)
+                    self.metric(None, -1, labels_1, preds_ctr, self.mode,
+                                pre_name="ctr", cal_prob=None, pos_sample=False)
+                    self.metric(None, -1, labels_2, preds_cvr, self.mode,
+                                label_filter=labels_1, pre_name="cvr", cal_prob=None, pos_sample=False)
+                    self.metric(None, -1, labels_2, preds_ctcvr, self.mode,
+                                pre_name="ctcvr", cal_prob=None, pos_sample=False)
+            else:
+                graph, sess = load_model(pb_path)
+                eval_preds = graph.get_tensor_by_name('predictionNode:0')
+                eval_id_hldr = graph.get_tensor_by_name('id:0')
+                eval_wt_hldr = graph.get_tensor_by_name('wt:0')
+                if self.dense_num != 0:
+                    try:
+                        eval_dense_hldr = graph.get_tensor_by_name('dense:0')
+                    except KeyError:
+                        eval_dense_hldr = None
+
+                _, labels, preds, group_ids = self.evaluate(self.config,
+                                                            None if self.dense_num == 0 else eval_dense_hldr,
+                                                            eval_id_hldr,
+                                                            eval_wt_hldr,
+                                                            eval_preds,
+                                                            self.test_gen,
+                                                            self.num_inputs,
+                                                            self.dataset,
+                                                            self.batch_size,
+                                                            sess,
+                                                            write_predict_label=self.config.WRITE_PREDICT_LABEL)
+                self.metric(None, -1, labels[:, 0] if len(labels.shape) == 2 else labels,
+                            preds, self.mode, group_ids, self.config.TOP_K_NDCG)
+
+    def get_data_process_info(self):
+        try:
+            mtp_task_info_dir = os.path.join(self.config.DATA_DIR, 'mtpTaskInfo.txt')
+            with open(mtp_task_info_dir, 'r') as result_file:
+                self.data_process_info = result_file.read()
+        except Exception:
+            print("read mtpTaskInfo.txt error!")
+        finally:
+            pass
+
+
+def compute_lambda(args):  # true_scores, predicted_scores, group_pairs, idcg, group_keys
+    """
+        Returns the lambda and w values for a given query.
+        Parameters
+        ----------
+        args : zipped value of true_scores, predicted_scores, group_pairs, idcg, group_keys
+            Contains a list of the true labels of documents, list of the predicted labels of documents,
+            i and j pairs where true_score[i] > true_score[j], idcg values, and group keys.
+
+        Returns
+        -------
+        lambdas : numpy array
+            This contains the calculated lambda values
+        # no sense
+        w : numpy array
+            This contains the computed w values
+        group_keys : int
+            This is the query id these values refer to
+    """
+    true_scores, predicted_scores, group_pairs, idcg, group_keys = args
+    num_elements = len(true_scores)  # number of element in the current group
+    sorted_indexes = np.argsort(predicted_scores)[::-1]
+    rev_indexes = np.argsort(sorted_indexes)
+    true_scores = true_scores[sorted_indexes]
+    predicted_scores = predicted_scores[sorted_indexes]
+    lambdas = np.zeros(num_elements)
+
+    single_dcgs = {}
+    for i, j in group_pairs:
+        # group_pairs
+        if (i, i) not in single_dcgs:
+            single_dcgs[(i, i)] = single_dcg(true_scores, i, i)
+        single_dcgs[(i, j)] = single_dcg(true_scores, i, j)
+        # group_pairs 2
+        if (j, j) not in single_dcgs:
+            single_dcgs[(j, j)] = single_dcg(true_scores, j, j)
+        single_dcgs[(j, i)] = single_dcg(true_scores, j, i)
+
+    for i, j in group_pairs:
+        # group_pairs
+        try:
+            z_ndcg = abs(single_dcgs[(i, j)] - single_dcgs[(i, i)] + single_dcgs[(j, i)] - single_dcgs[(j, j)]) / idcg
+        except KeyError:
+            # print some print
+            print("You can't divide by 0!")
+        try:
+            rho = 1 / (1 + np.exp(predicted_scores[i] - predicted_scores[j]))
+        except Exception:
+            print('zero')
+        rho_complement = 1.0 - rho
+        lambda_val = z_ndcg * rho
+        lambdas[i] += lambda_val
+        lambdas[j] -= lambda_val
+
+    return lambdas[rev_indexes], group_keys
+
+
+def single_dcg(scores, i, j):
+    """
+        Returns the DCG value at a single point.
+        Parameters
+        ----------
+        scores : type is  list
+            Contains labels in a certain ranked order
+        i : type is int
+            This points to the ith value in scores
+        j : type is int
+            This sets the ith value in scores to be the jth rank
+
+        Returns
+        -------
+        Single_DCG: type is int
+            This is the value of the DCG at a single point
+    """
+    try:
+        ret_ = (np.power(2, scores[i]) - 1) / np.log2(j + 2)
+    except Exception:
+        print('zero')
+    return ret_
