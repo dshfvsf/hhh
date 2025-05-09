@@ -1,0 +1,5 @@
+{
+    "inputDirs": ["data_dir","target_dir"],
+    "startScript": "DL_algorithm/mtp-listen-dl-offline.sh",
+    "parameter": []
+}
